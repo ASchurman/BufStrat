@@ -55,6 +55,9 @@ static BufferStrategyControl *StrategyControl = NULL;
  * Private (non-shared) state for managing a ring of shared buffers to re-use.
  * This is currently the only kind of BufferAccessStrategy object, but someday
  * we might have more kinds.
+ * Since the buffer ring replacement strategy was disabled, this struct is no
+ * longer used. To satisfy the compiler, this code has not been removed or
+ * commented out.
  */
 typedef struct BufferAccessStrategyData
 {
@@ -124,7 +127,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 		elog(ERROR, "StrategyGetBuffer: strategy is not default");
 	}
 
-	/* Nope, so lock the freelist */
+	/* lock the freelist */
 	*lock_held = true;
 	LWLockAcquire(BufFreelistLock, LW_EXCLUSIVE);
 
@@ -392,6 +395,11 @@ StrategyInitialize(bool init)
 
 /* ----------------------------------------------------------------
  *				Backend-private buffer ring management
+ *              
+ * Since the buffer ring replacement strategy was disabled by making
+ * GetAccessStrategy() return NULL, these functions are no longer
+ * used. To be safe (and to satisfy the compiler), they haven't
+ * been deleted or commented out.
  * ----------------------------------------------------------------
  */
 
