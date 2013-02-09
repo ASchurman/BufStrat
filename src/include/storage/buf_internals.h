@@ -44,14 +44,10 @@
 typedef bits16 BufFlags;
 
 /*
- * The maximum allowed value of usage_count represents a tradeoff between
- * accuracy and speed of the clock-sweep buffer management algorithm.  A
- * large value (comparable to NBuffers) would approximate LRU semantics.
- * But it can take as many as BM_MAX_USAGE_COUNT+1 complete cycles of
- * clock sweeps to find a free buffer, so in practice we don't want the
- * value to be very large.
+ * Since the usage_count field of BufferDesc was removed when switching from the
+ * clock buffer replacement strategy, this macro is no longer used.
  */
-#define BM_MAX_USAGE_COUNT	5
+/*#define BM_MAX_USAGE_COUNT	5*/
 
 /*
  * Buffer tag identifies which disk block the buffer contains.
@@ -135,9 +131,11 @@ typedef struct sbufdesc
 {
 	BufferTag	tag;			/* ID of page contained in buffer */
 	BufFlags	flags;			/* see bit definitions above */
-	uint16		usage_count;	/* usage counter for clock sweep code */
 	unsigned	refcount;		/* # of backends holding pins on buffer */
 	int			wait_backend_pid;		/* backend PID of pin-count waiter */
+
+	int 		mruNext;		/* link to buf used less recently */
+	int 		mruPrev;		/* link to buf used more recently */
 
 	slock_t		buf_hdr_lock;	/* protects the above fields */
 
@@ -149,6 +147,16 @@ typedef struct sbufdesc
 } BufferDesc;
 
 #define BufferDescriptorGetBuffer(bdesc) ((bdesc)->buf_id + 1)
+
+/*
+ * The mruNext and mruPrev fields each hold either an index to another buffer
+ * header or one of these special values. MRU_END_OF_LIST is held in both the
+ * mruNext of the last buffer in the list and the mruPrev of the first buffer
+ * in the list. Both mruNext and mruPrev are MRU_NOT_IN_LIST if the buffer is
+ * not in the MRU linked list.
+ */
+#define MRU_END_OF_LIST			(-1)
+#define MRU_NOT_IN_LIST			(-2)
 
 /*
  * The freeNext field is either the index of the next freelist entry,
@@ -187,6 +195,7 @@ extern volatile BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy,
 extern void StrategyFreeBuffer(volatile BufferDesc *buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy,
 					 volatile BufferDesc *buf);
+extern void StrategyUsingBuffer(volatile BufferDesc *buf);
 
 extern int	StrategySyncStart(uint32 *complete_passes, uint32 *num_buf_alloc);
 extern void StrategyNotifyBgWriter(Latch *bgwriterLatch);

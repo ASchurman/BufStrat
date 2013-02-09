@@ -24,8 +24,7 @@
  */
 typedef struct
 {
-	/* Clock sweep hand: index of next buffer to consider grabbing */
-	int			nextVictimBuffer;
+	int 		mruHead;			/* Head of MRU linked list */
 
 	int			firstFreeBuffer;	/* Head of list of unused buffers */
 	int			lastFreeBuffer; /* Tail of list of unused buffers */
@@ -39,7 +38,8 @@ typedef struct
 	 * Statistics.	These counters should be wide enough that they can't
 	 * overflow during a single bgwriter cycle.
 	 */
-	uint32		completePasses; /* Complete cycles of the clock sweep */
+	/* Since we're no longer using clock, completePasses no longer makes sense*/
+	/* uint32		completePasses; /* Complete cycles of the clock sweep */
 	uint32		numBufferAllocs;	/* Buffers allocated since last reset */
 
 	/*
@@ -52,9 +52,6 @@ typedef struct
 static BufferStrategyControl *StrategyControl = NULL;
 
 /*
- * Private (non-shared) state for managing a ring of shared buffers to re-use.
- * This is currently the only kind of BufferAccessStrategy object, but someday
- * we might have more kinds.
  * Since the buffer ring replacement strategy was disabled, this struct is no
  * longer used. To satisfy the compiler, this code has not been removed or
  * commented out.
@@ -116,7 +113,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 {
 	volatile BufferDesc *buf;
 	Latch	   *bgwriterLatch;
-	int			trycounter;
+	int 		nextVictimBuffer;
 
 	/*
 	 * Make sure that we weren't given a strategy object, since non-default
@@ -124,7 +121,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 	 */
 	if (strategy != NULL)
 	{
-		elog(ERROR, "StrategyGetBuffer: strategy is not default");
+		elog(DEBUG1, "StrategyGetBuffer: strategy is not default");
 	}
 
 	/* lock the freelist */
@@ -169,14 +166,14 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 		buf->freeNext = FREENEXT_NOT_IN_LIST;
 
 		/*
-		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
-		 * it; discard it and retry.  (This can only happen if VACUUM put a
+		 * If the buffer is pinned or is in the recently used list, we cannot
+		 * use it; discard it and retry.  (This can only happen if VACUUM put a
 		 * valid buffer in the freelist and then someone else used it before
 		 * we got to it.  It's probably impossible altogether as of 8.3, but
 		 * we'd better check anyway.)
 		 */
 		LockBufHdr(buf);
-		if (buf->refcount == 0 && buf->usage_count == 0)
+		if (buf->refcount == 0 && buf->mruNext == MRU_NOT_IN_LIST)
 		{
 			if (strategy != NULL)
 				AddBufferToRing(strategy, buf);
@@ -185,51 +182,34 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 		UnlockBufHdr(buf);
 	}
 
-	/* Nothing on the freelist, so run the "clock sweep" algorithm */
-	trycounter = NBuffers;
+	/* Nothing on the freelist, so run the MRU algorithm */
+	nextVictimBuffer = StrategyControl->mruHead;
 	for (;;)
 	{
-		buf = &BufferDescriptors[StrategyControl->nextVictimBuffer];
-
-		if (++StrategyControl->nextVictimBuffer >= NBuffers)
-		{
-			StrategyControl->nextVictimBuffer = 0;
-			StrategyControl->completePasses++;
-		}
+		buf = &BufferDescriptors[nextVictimBuffer];
 
 		/*
-		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
-		 * it; decrement the usage_count (unless pinned) and keep scanning.
+		 * If the buffer is pinned, we cannot use it; leave it in the same spot
+		 * in the MRU linked list and keep scanning.
 		 */
-		LockBufHdr(buf);
-		if (buf->refcount == 0)
-		{
-			if (buf->usage_count > 0)
-			{
-				buf->usage_count--;
-				trycounter = NBuffers;
-			}
-			else
-			{
-				/* Found a usable buffer */
-				if (strategy != NULL)
-					AddBufferToRing(strategy, buf);
-				return buf;
-			}
-		}
-		else if (--trycounter == 0)
-		{
-			/*
-			 * We've scanned all the buffers without making any state changes,
-			 * so all the buffers are pinned (or were when we looked at them).
-			 * We could hope that someone will free one eventually, but it's
-			 * probably better to fail than to risk getting stuck in an
-			 * infinite loop.
-			 */
-			UnlockBufHdr(buf);
-			elog(ERROR, "no unpinned buffers available");
-		}
-		UnlockBufHdr(buf);
+		 LockBufHdr(buf);
+		 if (buf->refcount == 0)
+		 {
+		 	/* Found a usable buffer */
+		 	return buf;
+		 }
+		 else if(buf->mruNext == MRU_END_OF_LIST)
+		 {
+		 	/*
+		 	 * We've gone through all of the MRU linked list, so all of the
+		 	 * buffers must be pinned. As in the original PostgreSQL 9.2.2
+		 	 * code, we'll give up and die rather than risk getting caught in
+		 	 * an infinite loop while hoping that someone eventually frees
+		 	 * a buffer.
+		 	 */
+		 	UnlockBufHdr(buf);
+		 	elog(ERROR, "no unpinned buffers available");
+		 }
 	}
 
 	/* not reached */
@@ -237,7 +217,29 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 }
 
 /*
+ * StrategyUsingBuffer
+ * 
+ *  Called by PinBuffer in bufmgr.c to indicate that a buffer is being used.
+ *  This modifies the MRU linked list, placing buf at the head.
+ */
+void
+StrategyUsingBuffer(volatile BufferDesc *buf)
+{
+	/*
+	 * If buf is already the head of the MRU list, return before taking the time
+	 * to acquire a spinlock.
+	 */
+	if(&BufferDescriptors[mruHead] == buf)
+		return;
+
+	/* TODO-AMS: implement StrategyUsingBuffer */
+}
+
+/*
  * StrategyFreeBuffer: put a buffer on the freelist
+ *
+ * TODO-AMS: when a buffer is put on the freelist, remove it from the MRU list if 
+ * it is already there.
  */
 void
 StrategyFreeBuffer(volatile BufferDesc *buf)
