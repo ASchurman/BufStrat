@@ -106,7 +106,7 @@ typedef struct buftag
  *	BufferDesc -- shared descriptor/state data for a single shared buffer.
  *
  * Note: buf_hdr_lock must be held to examine or change the tag, flags,
- * usage_count, refcount, or wait_backend_pid fields.  buf_id field never
+ * refcount, or wait_backend_pid fields.  buf_id field never
  * changes after initialization, so does not need locking.	freeNext is
  * protected by the BufFreelistLock not buf_hdr_lock.  The LWLocks can take
  * care of themselves.	The buf_hdr_lock is *not* used to control access to
@@ -195,7 +195,7 @@ extern volatile BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy,
 extern void StrategyFreeBuffer(volatile BufferDesc *buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy,
 					 volatile BufferDesc *buf);
-extern void StrategyUsingBuffer(volatile BufferDesc *buf);
+extern void StrategyUsedBuffer(volatile BufferDesc *buf);
 
 extern int	StrategySyncStart(uint32 *complete_passes, uint32 *num_buf_alloc);
 extern void StrategyNotifyBgWriter(Latch *bgwriterLatch);

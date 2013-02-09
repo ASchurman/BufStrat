@@ -166,12 +166,13 @@ PrefetchBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
 		 * If the block *is* in buffers, we do nothing.  This is not really
 		 * ideal: the block might be just about to be evicted, which would be
 		 * stupid since we know we are going to need it soon.  But the only
-		 * easy answer is to bump the usage_count, which does not seem like a
-		 * great solution: when the caller does ultimately touch the block,
-		 * usage_count would get bumped again, resulting in too much
-		 * favoritism for blocks that are involved in a prefetch sequence. A
-		 * real fix would involve some additional per-buffer state, and it's
-		 * not clear that there's enough of a problem to justify that.
+		 * easy answer is to bump the buf to the head of the usage list,
+		 * which does not seem like a great solution: when the caller does
+		 * ultimately touch the block and unpin it, it'll get bumped again,
+		 * resulting in too much favoritism for blocks that are involved in
+		 * a prefetch sequence. A real fix would involve some additional
+		 * per-buffer state, and it's not clear that there's enough of a
+		 * problem to justify that.
 		 */
 	}
 #endif   /* USE_PREFETCH */
@@ -510,8 +511,7 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
  *		victim and evicts the old page, but does NOT read in new page.
  *
  * "strategy" can be a buffer replacement strategy object, or NULL for
- * the default strategy.  The selected buffer's usage_count is advanced when
- * using the default strategy, but otherwise possibly not (see PinBuffer).
+ * the default strategy.
  *
  * The returned buffer is pinned and is already marked as holding the
  * desired page.  If it already did have the desired page, *foundPtr is
@@ -816,9 +816,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * Okay, it's finally safe to rename the buffer.
 	 *
 	 * Clearing BM_VALID here is necessary, clearing the dirtybits is just
-	 * paranoia.  We also reset the usage_count since any recency of use of
-	 * the old content is no longer relevant.  (The usage_count starts out at
-	 * 1 so that the buffer can survive one clock-sweep pass.)
+	 * paranoia.
 	 */
 	buf->tag = newTag;
 	buf->flags &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_PERMANENT);
@@ -826,7 +824,6 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		buf->flags |= BM_TAG_VALID | BM_PERMANENT;
 	else
 		buf->flags |= BM_TAG_VALID;
-	buf->usage_count = 1;
 
 	UnlockBufHdr(buf);
 
@@ -936,7 +933,6 @@ retry:
 	oldFlags = buf->flags;
 	CLEAR_BUFFERTAG(buf->tag);
 	buf->flags = 0;
-	buf->usage_count = 0;
 
 	UnlockBufHdr(buf);
 
@@ -1059,14 +1055,6 @@ ReleaseAndReadBuffer(Buffer buffer,
 /*
  * PinBuffer -- make buffer unavailable for replacement.
  *
- * For the default access strategy, the buffer's usage_count is incremented
- * when we first pin it; for other strategies we just make sure the usage_count
- * isn't zero.  (The idea of the latter is that we don't want synchronized
- * heap scans to inflate the count, but we need it to not be zero to discourage
- * other backends from stealing buffers from our ring.	As long as we cycle
- * through the ring faster than the global clock-sweep cycles, buffers in
- * our ring won't be chosen as victims for replacement by other backends.)
- *
  * This should be applied only to shared buffers, never local ones.
  *
  * Note that ResourceOwnerEnlargeBuffers must have been done already.
@@ -1084,16 +1072,6 @@ PinBuffer(volatile BufferDesc *buf, BufferAccessStrategy strategy)
 	{
 		LockBufHdr(buf);
 		buf->refcount++;
-		if (strategy == NULL)
-		{
-			if (buf->usage_count < BM_MAX_USAGE_COUNT)
-				buf->usage_count++;
-		}
-		else
-		{
-			if (buf->usage_count == 0)
-				buf->usage_count = 1;
-		}
 		result = (buf->flags & BM_VALID) != 0;
 		UnlockBufHdr(buf);
 	}
@@ -1112,11 +1090,6 @@ PinBuffer(volatile BufferDesc *buf, BufferAccessStrategy strategy)
 /*
  * PinBuffer_Locked -- as above, but caller already locked the buffer header.
  * The spinlock is released before return.
- *
- * Currently, no callers of this function want to modify the buffer's
- * usage_count at all, so there's no need for a strategy parameter.
- * Also we don't bother with a BM_VALID test (the caller could check that for
- * itself).
  *
  * Note: use of this routine is frequently mandatory, not just an optimization
  * to save a spin lock/unlock cycle, because we need to pin a buffer before
@@ -1138,6 +1111,10 @@ PinBuffer_Locked(volatile BufferDesc *buf)
 
 /*
  * UnpinBuffer -- make buffer available for replacement.
+ *
+ * In making a buffer available for replacement, UnpinBuffer calls
+ * StrategyUsedBuffer in freelist.c to move the buffer to the head of
+ * the used buffers list.
  *
  * This should be applied only to shared buffers, never local ones.
  *
@@ -1180,6 +1157,9 @@ UnpinBuffer(volatile BufferDesc *buf, bool fixOwner)
 		}
 		else
 			UnlockBufHdr(buf);
+
+		/* Tell the replacement strategy that someone finished using buf */
+		StrategyUsedBuffer(buf);
 	}
 }
 
@@ -1651,7 +1631,7 @@ SyncOneBuffer(int buf_id, bool skip_recently_used)
 	 */
 	LockBufHdr(bufHdr);
 
-	if (bufHdr->refcount == 0 && bufHdr->usage_count == 0)
+	if (bufHdr->refcount == 0)
 		result |= BUF_REUSABLE;
 	else if (skip_recently_used)
 	{

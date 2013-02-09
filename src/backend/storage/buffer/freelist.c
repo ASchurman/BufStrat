@@ -89,6 +89,7 @@ typedef struct BufferAccessStrategyData
 static volatile BufferDesc *GetBufferFromRing(BufferAccessStrategy strategy);
 static void AddBufferToRing(BufferAccessStrategy strategy,
 				volatile BufferDesc *buf);
+static void MRURemove(volatile BufferDesc *buf)
 
 
 /*
@@ -182,7 +183,15 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 		UnlockBufHdr(buf);
 	}
 
-	/* Nothing on the freelist, so run the MRU algorithm */
+	/*
+	 * Nothing on the freelist, so run the MRU algorithm. Note that if the head
+	 * of the mru linked list is MRU_END_OF_LIST, the list is empty. This
+	 * shouldn't happen if there aren't any buffers in the freelist, but to be
+	 * safe, let's check.
+	 */
+	if (StrategyControl->mruHead == MRU_END_OF_LIST)
+		elog(ERROR, "no buffers in the MRU linked list");
+
 	nextVictimBuffer = StrategyControl->mruHead;
 	for (;;)
 	{
@@ -192,24 +201,34 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 		 * If the buffer is pinned, we cannot use it; leave it in the same spot
 		 * in the MRU linked list and keep scanning.
 		 */
-		 LockBufHdr(buf);
-		 if (buf->refcount == 0)
-		 {
-		 	/* Found a usable buffer */
-		 	return buf;
-		 }
-		 else if(buf->mruNext == MRU_END_OF_LIST)
-		 {
-		 	/*
-		 	 * We've gone through all of the MRU linked list, so all of the
-		 	 * buffers must be pinned. As in the original PostgreSQL 9.2.2
-		 	 * code, we'll give up and die rather than risk getting caught in
-		 	 * an infinite loop while hoping that someone eventually frees
-		 	 * a buffer.
-		 	 */
-		 	UnlockBufHdr(buf);
-		 	elog(ERROR, "no unpinned buffers available");
-		 }
+		LockBufHdr(buf);
+		if (buf->refcount == 0)
+		{
+			/* buf is usable! Update the mru linked list and return buf. */
+			MRURemove(buf);
+			return buf;
+		}
+		else if (buf->mruNext == MRU_END_OF_LIST)
+		{
+			/*
+			 * We've gone through all of the MRU linked list, so all of the
+			 * buffers must be pinned. As in the original PostgreSQL 9.2.2
+			 * code, we'll give up and die rather than risk getting caught in
+			 * an infinite loop while hoping that someone eventually frees
+			 * a buffer.
+			 */
+			UnlockBufHdr(buf);
+			elog(ERROR, "no unpinned buffers available");
+		}
+		else
+		{
+			/*
+			 * buf isn't usable, and buf isn't at the end of the list, so
+			 * update nextVictimBuffer to check the next buffer
+			 */
+			nextVictimBuffer = buf->mruNext;
+			UnlockBufHdr(buf);
+		}
 	}
 
 	/* not reached */
@@ -217,29 +236,38 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 }
 
 /*
- * StrategyUsingBuffer
+ * StrategyUsedBuffer
  * 
- *  Called by PinBuffer in bufmgr.c to indicate that a buffer is being used.
+ *  Called by PinBuffer in bufmgr.c to indicate that a buffer has been used.
  *  This modifies the MRU linked list, placing buf at the head.
  */
 void
-StrategyUsingBuffer(volatile BufferDesc *buf)
+StrategyUsedBuffer(volatile BufferDesc *buf)
 {
-	/*
-	 * If buf is already the head of the MRU list, return before taking the time
-	 * to acquire a spinlock.
-	 */
-	if(&BufferDescriptors[mruHead] == buf)
+	if (buf == &BufferDescriptors[StrategyControl->mruHead])
+	{
+		/* buf is already the head; don't do anything. */
 		return;
-
-	/* TODO-AMS: implement StrategyUsingBuffer */
+	}
+	else
+	{
+		/*
+		 * If buf is in the list already, remove it before reinserting it at
+		 * the head
+		 */
+		LockBufHdr(buf);
+		MRURemove(buf);
+		buf->mruPrev = MRU_END_OF_LIST;
+		buf->mruNext = StrategyControl->mruHead;
+		StrategyControl->mruHead = buf->buf_id;
+		UnlockBufHdr(buf);
+	}
 }
 
 /*
  * StrategyFreeBuffer: put a buffer on the freelist
  *
- * TODO-AMS: when a buffer is put on the freelist, remove it from the MRU list if 
- * it is already there.
+ * Also removes the buffer from the MRU list.
  */
 void
 StrategyFreeBuffer(volatile BufferDesc *buf)
@@ -256,6 +284,10 @@ StrategyFreeBuffer(volatile BufferDesc *buf)
 		if (buf->freeNext < 0)
 			StrategyControl->lastFreeBuffer = buf->buf_id;
 		StrategyControl->firstFreeBuffer = buf->buf_id;
+
+		LockBufHdr(buf);
+		MRURemove(buf);
+		UnlockBufHdr(buf);
 	}
 
 	LWLockRelease(BufFreelistLock);
@@ -267,10 +299,12 @@ StrategyFreeBuffer(volatile BufferDesc *buf)
  * The result is the buffer index of the best buffer to sync first.
  * BufferSync() will proceed circularly around the buffer array from there.
  *
- * In addition, we return the completed-pass count (which is effectively
- * the higher-order bits of nextVictimBuffer) and the count of recent buffer
- * allocs if non-NULL pointers are passed.	The alloc count is reset after
- * being read.
+ * In addition, we return the count of recent buffer allocs if non-NULL
+ * pointers are passed. The alloc count is reset after being read. Since
+ * the completePasses field of StrategyControl no longer makes sense when not
+ * using the clock replacement strategy, a hardcoded constant is returned in
+ * *complete_passes; unless this causes something horrible to happen, this
+ * will remain the case.
  */
 int
 StrategySyncStart(uint32 *complete_passes, uint32 *num_buf_alloc)
@@ -278,9 +312,17 @@ StrategySyncStart(uint32 *complete_passes, uint32 *num_buf_alloc)
 	int			result;
 
 	LWLockAcquire(BufFreelistLock, LW_EXCLUSIVE);
-	result = StrategyControl->nextVictimBuffer;
+	result = StrategyControl->mruHead;
 	if (complete_passes)
-		*complete_passes = StrategyControl->completePasses;
+	{
+		/*
+		 * Since StrategyControl->completePasses was removed when switching
+		 * from the clock replacement strategy, I'm not sure what should be
+		 * returned in *complete_passes. For now, always return 1 and see if
+		 * anything horrible happens.
+		 */
+		*complete_passes = 1;
+	}
 	if (num_buf_alloc)
 	{
 		*num_buf_alloc = StrategyControl->numBufferAllocs;
@@ -380,11 +422,10 @@ StrategyInitialize(bool init)
 		StrategyControl->firstFreeBuffer = 0;
 		StrategyControl->lastFreeBuffer = NBuffers - 1;
 
-		/* Initialize the clock sweep pointer */
-		StrategyControl->nextVictimBuffer = 0;
+		/* Initialize the MRU pointer */
+		StrategyControl->mruHead = MRU_END_OF_LIST;
 
 		/* Clear statistics */
-		StrategyControl->completePasses = 0;
 		StrategyControl->numBufferAllocs = 0;
 
 		/* No pending notification */
@@ -394,6 +435,48 @@ StrategyInitialize(bool init)
 		Assert(!init);
 }
 
+/* ----------------------------------------------------------------
+ *				Private MRU management functions
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * MRURemove -- remove a buffer from the MRU linked list
+ * 
+ * Does nothing if the buffer isn't already in the list.
+ * Assumes that a spin lock is held on buf before calling.
+ */
+static void
+MRURemove(volatile BufferDesc *buf)
+{
+	volatile BufferDesc *bufPrev, *bufNext;
+
+	if (buf->mruPrev == MRU_NOT_IN_LIST)
+		return;
+	else if (buf->mruPrev == MRU_END_OF_LIST)
+		StrategyControl->mruHead = buf->mruNext;
+	else
+	{
+		/*
+		 * buf isn't the head of the list; we need to update the mruNext
+		 * and mruPrev pointers of the buffers before and after buf.
+		 */
+		bufPrev = &BufferDescriptors[buf->mruPrev];
+		LockBufHdr(bufPrev);
+		bufPrev->mruNext = buf->mruNext;
+		UnlockBufHdr(bufPrev);
+
+		if (buf->mruNext != MRU_END_OF_LIST)
+		{
+			bufNext = &BufferDescriptors[buf->mruNext];
+			LockBufHdr(bufNext);
+			bufNext->mruPrev = buf->mruPrev;
+			UnlockBufHdr(bufNext);
+		}
+	}
+
+	buf->mruPrev = buf->mruNext = MRU_NOT_IN_LIST;
+}
 
 /* ----------------------------------------------------------------
  *				Backend-private buffer ring management
@@ -445,48 +528,10 @@ FreeAccessStrategy(BufferAccessStrategy strategy)
 static volatile BufferDesc *
 GetBufferFromRing(BufferAccessStrategy strategy)
 {
-	volatile BufferDesc *buf;
-	Buffer		bufnum;
+	/* this should never be called */
+	elog(ERROR, "reached freelist.c:GetBufferFromRing");
 
-	/* Advance to next ring slot */
-	if (++strategy->current >= strategy->ring_size)
-		strategy->current = 0;
-
-	/*
-	 * If the slot hasn't been filled yet, tell the caller to allocate a new
-	 * buffer with the normal allocation strategy.	He will then fill this
-	 * slot by calling AddBufferToRing with the new buffer.
-	 */
-	bufnum = strategy->buffers[strategy->current];
-	if (bufnum == InvalidBuffer)
-	{
-		strategy->current_was_in_ring = false;
-		return NULL;
-	}
-
-	/*
-	 * If the buffer is pinned we cannot use it under any circumstances.
-	 *
-	 * If usage_count is 0 or 1 then the buffer is fair game (we expect 1,
-	 * since our own previous usage of the ring element would have left it
-	 * there, but it might've been decremented by clock sweep since then). A
-	 * higher usage_count indicates someone else has touched the buffer, so we
-	 * shouldn't re-use it.
-	 */
-	buf = &BufferDescriptors[bufnum - 1];
-	LockBufHdr(buf);
-	if (buf->refcount == 0 && buf->usage_count <= 1)
-	{
-		strategy->current_was_in_ring = true;
-		return buf;
-	}
-	UnlockBufHdr(buf);
-
-	/*
-	 * Tell caller to allocate a new buffer with the normal allocation
-	 * strategy.  He'll then replace this ring element via AddBufferToRing.
-	 */
-	strategy->current_was_in_ring = false;
+	/* not reached */
 	return NULL;
 }
 
@@ -499,7 +544,8 @@ GetBufferFromRing(BufferAccessStrategy strategy)
 static void
 AddBufferToRing(BufferAccessStrategy strategy, volatile BufferDesc *buf)
 {
-	strategy->buffers[strategy->current] = BufferDescriptorGetBuffer(buf);
+	/* this should never be called */
+	elog(ERROR, "reached freelist.c:AddBufferToRing");
 }
 
 /*
@@ -516,20 +562,8 @@ AddBufferToRing(BufferAccessStrategy strategy, volatile BufferDesc *buf)
 bool
 StrategyRejectBuffer(BufferAccessStrategy strategy, volatile BufferDesc *buf)
 {
-	/* We only do this in bulkread mode */
-	if (strategy->btype != BAS_BULKREAD)
-		return false;
-
-	/* Don't muck with behavior of normal buffer-replacement strategy */
-	if (!strategy->current_was_in_ring ||
-	  strategy->buffers[strategy->current] != BufferDescriptorGetBuffer(buf))
-		return false;
-
-	/*
-	 * Remove the dirty buffer from the ring; necessary to prevent infinite
-	 * loop if all ring members are dirty.
-	 */
-	strategy->buffers[strategy->current] = InvalidBuffer;
+	/* this should never be called */
+	elog(ERROR, "reached freelist.c:StrategyRejectBuffer");
 
 	return true;
 }
