@@ -221,5 +221,6 @@ extern void DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
 							BlockNumber firstDelBlock);
 extern void DropRelFileNodeAllLocalBuffers(RelFileNode rnode);
 extern void AtEOXact_LocalBuffers(bool isCommit);
+extern void LocalUsedBuffer(BufferDesc *buf);
 
 #endif   /* BUFMGR_INTERNALS_H */

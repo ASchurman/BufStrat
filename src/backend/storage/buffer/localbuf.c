@@ -43,6 +43,7 @@ BufferDesc *LocalBufferDescriptors = NULL;
 Block	   *LocalBufferBlockPointers = NULL;
 int32	   *LocalRefCount = NULL;
 
+static int	localMruHead = MRU_END_OF_LIST;
 static int	nextFreeLocalBuf = 0;
 
 static HTAB *LocalBufHash = NULL;
@@ -51,6 +52,76 @@ static HTAB *LocalBufHash = NULL;
 static void InitLocalBuffers(void);
 static Block GetLocalBufferStorage(void);
 
+
+/*
+ * LocalMRURemove - remove a buffer from the local recently used list
+ *
+ * Does nothing if the buffer is not currently in the local recently used list
+ * Analogous to MRURemove defined in freelist.c
+ */
+static void
+LocalMRURemove(BufferDesc *bufHdr)
+{
+	BufferDesc *bufPrev, *bufNext;
+
+	if (bufHdr->mruPrev == MRU_NOT_IN_LIST)
+		return;
+	else if (bufHdr->mruPrev == MRU_END_OF_LIST)
+		localMruHead = bufHdr->mruNext;
+	else
+	{
+		/*
+		 * bufHdr isn't the head of the list; we need to update the mruNext
+		 * and mruPrev pointers of the buffers before and after bufHdr.
+		 */
+		bufPrev = &LocalBufferDescriptors[bufHdr->mruPrev];
+		bufPrev->mruNext = bufHdr->mruNext;
+
+		if (bufHdr->mruNext != MRU_END_OF_LIST)
+		{
+			bufNext = &LocalBufferDescriptors[bufHdr->mruNext];
+			bufNext->mruPrev = bufHdr->mruPrev;
+		}
+	}
+
+	bufHdr->mruPrev = bufHdr->mruNext = MRU_NOT_IN_LIST;
+}
+
+/*
+ * LocalUsedBuffer - moves a buffer to the head of the local recently used list
+ *
+ * Analogous to StrategyUsedBuffer in freelist.c
+ */
+void
+LocalUsedBuffer(BufferDesc *buf)
+{
+	BufferDesc *oldHead;
+
+	if (localMruHead != MRU_END_OF_LIST &&
+		buf == &LocalBufferDescriptors[localMruHead])
+	{
+		/* buf is already the head; don't do anything. */
+		return;
+	}
+	else
+	{
+		/*
+		 * If buf is in the list already, remove it before reinserting it at
+		 * the head
+		 */
+		LocalMRURemove(buf);
+		buf->mruPrev = MRU_END_OF_LIST;
+		buf->mruNext = localMruHead;
+
+		if (localMruHead != MRU_END_OF_LIST)
+		{
+			oldHead = &LocalBufferDescriptors[localMruHead];
+			oldHead->mruPrev = -(buf->buf_id + 2);
+		}
+
+		localMruHead = -(buf->buf_id + 2);
+	}
+}
 
 /*
  * LocalPrefetchBuffer -
@@ -95,8 +166,7 @@ LocalPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum,
  *
  * API is similar to bufmgr.c's BufferAlloc, except that we do not need
  * to do any locking since this is all local.	Also, IO_IN_PROGRESS
- * does not get set.  Lastly, we support only default access strategy
- * (hence, usage_count is always advanced).
+ * does not get set.  Lastly, we support only default access strategy.
  */
 BufferDesc *
 LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
@@ -106,7 +176,6 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	LocalBufferLookupEnt *hresult;
 	BufferDesc *bufHdr;
 	int			b;
-	int			trycounter;
 	bool		found;
 
 	INIT_BUFFERTAG(newTag, smgr->smgr_rnode.node, forkNum, blockNum);
@@ -129,11 +198,6 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 				smgr->smgr_rnode.node.relNode, forkNum, blockNum, -b - 1);
 #endif
 		/* this part is equivalent to PinBuffer for a shared buffer */
-		if (LocalRefCount[b] == 0)
-		{
-			if (bufHdr->usage_count < BM_MAX_USAGE_COUNT)
-				bufHdr->usage_count++;
-		}
 		LocalRefCount[b]++;
 		ResourceOwnerRememberBuffer(CurrentResourceOwner,
 									BufferDescriptorGetBuffer(bufHdr));
@@ -154,39 +218,63 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 #endif
 
 	/*
-	 * Need to get a new buffer.  We use a clock sweep algorithm (essentially
-	 * the same as what freelist.c does now...)
+	 * Need to get a new buffer. First try the local freelist
 	 */
-	trycounter = NLocBuffer;
-	for (;;)
+	found = false;
+	while (nextFreeLocalBuf >= 0)
 	{
-		b = nextFreeLocalBuf;
+		bufHdr = &LocalBufferDescriptors[nextFreeLocalBuf];
 
-		if (++nextFreeLocalBuf >= NLocBuffer)
-			nextFreeLocalBuf = 0;
+		LocalRefCount[nextFreeLocalBuf]++;
 
-		bufHdr = &LocalBufferDescriptors[b];
+		/* Remove the first free local buf from the local freelist */
+		nextFreeLocalBuf = bufHdr->freeNext;
+		bufHdr->freeNext = FREENEXT_NOT_IN_LIST;
 
-		if (LocalRefCount[b] == 0)
+		ResourceOwnerRememberBuffer(CurrentResourceOwner,
+									BufferDescriptorGetBuffer(bufHdr));
+		found = true;
+		break;
+	}
+
+	if (!found)
+	{
+		/* A free buffer was not found in the freelist. Run MRU. */
+		if (localMruHead == MRU_END_OF_LIST)
 		{
-			if (bufHdr->usage_count > 0)
-			{
-				bufHdr->usage_count--;
-				trycounter = NLocBuffer;
-			}
-			else
-			{
-				/* Found a usable buffer */
-				LocalRefCount[b]++;
-				ResourceOwnerRememberBuffer(CurrentResourceOwner,
-										  BufferDescriptorGetBuffer(bufHdr));
-				break;
-			}
-		}
-		else if (--trycounter == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-					 errmsg("no empty local buffer available")));
+					errmsg("MRU list empty")));
+		}
+
+		b = localMruHead;
+		for (;;)
+		{
+			bufHdr = &LocalBufferDescriptors[b];
+
+			if (LocalRefCount[b] == 0)
+			{
+				/*
+				 * bufHdr is usable! Remove it from the recently used list
+				 * before moving on.
+				 */
+				LocalMRURemove(bufHdr);
+				LocalRefCount[b]++;
+				ResourceOwnerRememberBuffer(CurrentResourceOwner,
+											BufferDescriptorGetBuffer(bufHdr));
+				break;
+				
+			}
+			else if (bufHdr->mruNext == MRU_END_OF_LIST)
+			{
+				/* Everything in the recently used list is pinned */
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+						errmsg("no empty local buffer available")));
+			}
+			else
+				b = bufHdr->mruNext;
+		}
 	}
 
 	/*
@@ -249,7 +337,6 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	bufHdr->tag = newTag;
 	bufHdr->flags &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_IO_ERROR);
 	bufHdr->flags |= BM_TAG_VALID;
-	bufHdr->usage_count = 1;
 
 	*foundPtr = FALSE;
 	return bufHdr;
@@ -316,6 +403,8 @@ DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
 					 relpathbackend(bufHdr->tag.rnode, MyBackendId,
 									bufHdr->tag.forkNum),
 					 LocalRefCount[i]);
+			/* Remove from recently used list */
+			LocalMRURemove(bufHdr);
 			/* Remove entry from hashtable */
 			hresult = (LocalBufferLookupEnt *)
 				hash_search(LocalBufHash, (void *) &bufHdr->tag,
@@ -325,7 +414,6 @@ DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
 			/* Mark buffer invalid */
 			CLEAR_BUFFERTAG(bufHdr->tag);
 			bufHdr->flags = 0;
-			bufHdr->usage_count = 0;
 		}
 	}
 }
@@ -356,6 +444,8 @@ DropRelFileNodeAllLocalBuffers(RelFileNode rnode)
 					 relpathbackend(bufHdr->tag.rnode, MyBackendId,
 									bufHdr->tag.forkNum),
 					 LocalRefCount[i]);
+			/* Remove from recently used list */
+			LocalMRURemove(bufHdr);
 			/* Remove entry from hashtable */
 			hresult = (LocalBufferLookupEnt *)
 				hash_search(LocalBufHash, (void *) &bufHdr->tag,
@@ -365,7 +455,6 @@ DropRelFileNodeAllLocalBuffers(RelFileNode rnode)
 			/* Mark buffer invalid */
 			CLEAR_BUFFERTAG(bufHdr->tag);
 			bufHdr->flags = 0;
-			bufHdr->usage_count = 0;
 		}
 	}
 }
@@ -399,6 +488,9 @@ InitLocalBuffers(void)
 	{
 		BufferDesc *buf = &LocalBufferDescriptors[i];
 
+		buf->mruNext = buf->mruPrev = MRU_NOT_IN_LIST;
+		buf->freeNext = i + 1;
+
 		/*
 		 * negative to indicate local buffer. This is tricky: shared buffers
 		 * start with 0. We have to start with -2. (Note that the routine
@@ -407,6 +499,9 @@ InitLocalBuffers(void)
 		 */
 		buf->buf_id = -i - 2;
 	}
+
+	/* correct last buffer header */
+	LocalBufferDescriptors[i-1].freeNext = FREENEXT_END_OF_LIST;
 
 	/* Create the lookup hash table */
 	MemSet(&info, 0, sizeof(info));

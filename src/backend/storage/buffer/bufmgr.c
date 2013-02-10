@@ -2353,6 +2353,7 @@ ReleaseBuffer(Buffer buffer)
 	{
 		Assert(LocalRefCount[-buffer - 1] > 0);
 		LocalRefCount[-buffer - 1]--;
+		LocalUsedBuffer(buffer);
 		return;
 	}
 
