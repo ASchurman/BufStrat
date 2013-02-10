@@ -65,7 +65,7 @@
 
 /* GUC variables */
 bool		zero_damaged_pages = false;
-int			bgwriter_lru_maxpages = 100;
+int			bgwriter_lru_maxpages = 0;
 double		bgwriter_lru_multiplier = 2.0;
 bool		track_io_timing = false;
 
