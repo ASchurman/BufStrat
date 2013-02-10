@@ -38,8 +38,6 @@ typedef struct
 	 * Statistics.	These counters should be wide enough that they can't
 	 * overflow during a single bgwriter cycle.
 	 */
-	/* Since we're no longer using clock, completePasses no longer makes sense*/
-	/* uint32		completePasses; /* Complete cycles of the clock sweep */
 	uint32		numBufferAllocs;	/* Buffers allocated since last reset */
 
 	/*
@@ -89,7 +87,7 @@ typedef struct BufferAccessStrategyData
 static volatile BufferDesc *GetBufferFromRing(BufferAccessStrategy strategy);
 static void AddBufferToRing(BufferAccessStrategy strategy,
 				volatile BufferDesc *buf);
-static void MRURemove(volatile BufferDesc *buf)
+static void MRURemove(volatile BufferDesc *buf);
 
 
 /*
@@ -244,7 +242,10 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 void
 StrategyUsedBuffer(volatile BufferDesc *buf)
 {
-	if (buf == &BufferDescriptors[StrategyControl->mruHead])
+	volatile BufferDesc *oldHead;
+
+	if (StrategyControl->mruHead != MRU_END_OF_LIST &&
+		buf == &BufferDescriptors[StrategyControl->mruHead])
 	{
 		/* buf is already the head; don't do anything. */
 		return;
@@ -259,8 +260,17 @@ StrategyUsedBuffer(volatile BufferDesc *buf)
 		MRURemove(buf);
 		buf->mruPrev = MRU_END_OF_LIST;
 		buf->mruNext = StrategyControl->mruHead;
-		StrategyControl->mruHead = buf->buf_id;
 		UnlockBufHdr(buf);
+
+		if (StrategyControl->mruHead != MRU_END_OF_LIST)
+		{
+			oldHead = &BufferDescriptors[StrategyControl->mruHead];
+			LockBufHdr(oldHead);
+			oldHead->mruPrev = buf->buf_id;
+			UnlockBufHdr(oldHead);
+		}
+
+		StrategyControl->mruHead = buf->buf_id;
 	}
 }
 
