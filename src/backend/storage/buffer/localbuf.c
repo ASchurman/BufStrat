@@ -67,7 +67,11 @@ LocalMRURemove(BufferDesc *bufHdr)
 	if (bufHdr->mruPrev == MRU_NOT_IN_LIST)
 		return;
 	else if (bufHdr->mruPrev == MRU_END_OF_LIST)
+	{
 		localMruHead = bufHdr->mruNext;
+		bufNext = &LocalBufferDescriptors[localMruHead];
+		bufNext->mruPrev = MRU_END_OF_LIST;
+	}
 	else
 	{
 		/*

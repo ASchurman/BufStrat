@@ -120,7 +120,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 	 */
 	if (strategy != NULL)
 	{
-		elog(DEBUG1, "StrategyGetBuffer: strategy is not default");
+		elog(ERROR, "StrategyGetBuffer: strategy is not default");
 	}
 
 	/* lock the freelist */
@@ -203,6 +203,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 		if (buf->refcount == 0)
 		{
 			/* buf is usable! Update the mru linked list and return buf. */
+			elog(DEBUG1, "StrategyGetBuffer: %i popping", buf->buf_id);
 			MRURemove(buf);
 			return buf;
 		}
@@ -248,6 +249,7 @@ StrategyUsedBuffer(volatile BufferDesc *buf)
 		buf == &BufferDescriptors[StrategyControl->mruHead])
 	{
 		/* buf is already the head; don't do anything. */
+		elog(DEBUG1, "StrategyUsedBuffer: %i already at head", buf->buf_id);
 		return;
 	}
 	else
@@ -258,6 +260,7 @@ StrategyUsedBuffer(volatile BufferDesc *buf)
 		 */
 		LockBufHdr(buf);
 		MRURemove(buf);
+		elog(DEBUG1, "StrategyUsedBuffer: %i moving to head", buf->buf_id);
 		buf->mruPrev = MRU_END_OF_LIST;
 		buf->mruNext = StrategyControl->mruHead;
 		UnlockBufHdr(buf);
@@ -455,6 +458,7 @@ StrategyInitialize(bool init)
  * 
  * Does nothing if the buffer isn't already in the list.
  * Assumes that a spin lock is held on buf before calling.
+ * Returns with a spin lock held on buf.
  */
 static void
 MRURemove(volatile BufferDesc *buf)
@@ -464,28 +468,45 @@ MRURemove(volatile BufferDesc *buf)
 	if (buf->mruPrev == MRU_NOT_IN_LIST)
 		return;
 	else if (buf->mruPrev == MRU_END_OF_LIST)
+	{
 		StrategyControl->mruHead = buf->mruNext;
+		buf->mruPrev = buf->mruNext = MRU_NOT_IN_LIST;
+		UnlockBufHdr(buf);
+
+		bufNext = &BufferDescriptors[StrategyControl->mruHead];
+		LockBufHdr(bufNext);
+		bufNext->mruPrev = MRU_END_OF_LIST;
+		UnlockBufHdr(bufNext);
+	}
 	else
 	{
 		/*
 		 * buf isn't the head of the list; we need to update the mruNext
 		 * and mruPrev pointers of the buffers before and after buf.
 		 */
-		bufPrev = &BufferDescriptors[buf->mruPrev];
+		int next = buf->mruNext;
+		int prev = buf->mruPrev;
+		buf->mruPrev = buf->mruNext = MRU_NOT_IN_LIST;
+
+		/* Unlock buf as we lock and modify other buf headers */
+		UnlockBufHdr(buf);
+
+		bufPrev = &BufferDescriptors[prev];
 		LockBufHdr(bufPrev);
-		bufPrev->mruNext = buf->mruNext;
+		bufPrev->mruNext = next;
 		UnlockBufHdr(bufPrev);
 
-		if (buf->mruNext != MRU_END_OF_LIST)
+		if (next != MRU_END_OF_LIST)
 		{
-			bufNext = &BufferDescriptors[buf->mruNext];
+			bufNext = &BufferDescriptors[next];
 			LockBufHdr(bufNext);
-			bufNext->mruPrev = buf->mruPrev;
+			bufNext->mruPrev = prev;
 			UnlockBufHdr(bufNext);
 		}
 	}
 
-	buf->mruPrev = buf->mruNext = MRU_NOT_IN_LIST;
+	/* Lock buf again like the caller expects */
+	LockBufHdr(buf);
 }
 
 /* ----------------------------------------------------------------
