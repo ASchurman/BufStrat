@@ -1306,15 +1306,22 @@ BufferSync(int flags)
  *
  * This is called periodically by the background writer process.
  *
- * Returns true if it's appropriate for the bgwriter process to go into
- * low-power hibernation mode.	(This happens if the strategy clock sweep
- * has been "lapped" and no buffer allocations have occurred recently,
- * or if the bgwriter has been effectively disabled by setting
- * bgwriter_lru_maxpages to 0.)
+ * Since much of this file doesn't make sense outside the context of
+ * the clock replacement strategy, this always returns true to
+ * indicate that it's appropriate for the bgwriter process to go into
+ * low-power hibernation mode.
  */
 bool
 BgBufferSync(void)
 {
+	/*
+	 * If something horrible happens because of this, I'll change it
+	 * later.
+	 */
+	return true;
+
+	/* NO CODE AFTER THIS POINT IS EVER REACHED */
+
 	/* info obtained from freelist.c */
 	int			strategy_buf_id;
 	uint32		strategy_passes;
