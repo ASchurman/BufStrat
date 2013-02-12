@@ -43,7 +43,8 @@ BufferDesc *LocalBufferDescriptors = NULL;
 Block	   *LocalBufferBlockPointers = NULL;
 int32	   *LocalRefCount = NULL;
 
-static int	localMruHead = MRU_END_OF_LIST;
+static int	localLruHead = LRU_END_OF_LIST;
+static int 	localLruTail = LRU_END_OF_LIST;
 static int	nextFreeLocalBuf = 0;
 
 static HTAB *LocalBufHash = NULL;
@@ -54,35 +55,39 @@ static Block GetLocalBufferStorage(void);
 
 
 /*
- * LocalMRURemove - remove a buffer from the local recently used list
+ * LocalLRURemove - remove a buffer from the local recently used list
  *
  * Does nothing if the buffer is not currently in the local recently used list
- * Analogous to MRURemove defined in freelist.c
+ * Analogous to LRURemove defined in freelist.c
  */
 static void
-LocalMRURemove(BufferDesc *bufHdr)
+LocalLRURemove(BufferDesc *bufHdr)
 {
 	BufferDesc *bufPrev, *bufNext;
 
-	int next = bufHdr->mruNext;
-	int prev = bufHdr->mruPrev;
+	int next = bufHdr->lruNext;
+	int prev = bufHdr->lruPrev;
 
-	if (prev == MRU_NOT_IN_LIST)
+	if (prev == LRU_NOT_IN_LIST)
 		return;
-	else if (prev == MRU_END_OF_LIST)
-		localMruHead = next;
+	
+	if (prev == LRU_END_OF_LIST)
+		localLruHead = next;
 
-	bufHdr->mruPrev = bufHdr->mruNext = MRU_NOT_IN_LIST;
+	if (next == LRU_END_OF_LIST)
+		localLruTail = prev;
 
-	if (prev > 0)
+	bufHdr->lruPrev = bufHdr->lruNext = LRU_NOT_IN_LIST;
+
+	if (prev >= 0)
 	{
 		bufPrev = &LocalBufferDescriptors[prev];
-		bufPrev->mruNext = next;
+		bufPrev->lruNext = next;
 	}
-	if (next > 0)
+	if (next >= 0)
 	{
 		bufNext = &LocalBufferDescriptors[next];
-		bufNext->mruPrev = prev;
+		bufNext->lruPrev = prev;
 	}
 }
 
@@ -96,10 +101,11 @@ LocalUsedBuffer(BufferDesc *buf)
 {
 	BufferDesc *oldHead;
 
-	if (localMruHead != MRU_END_OF_LIST &&
-		buf == &LocalBufferDescriptors[localMruHead])
+	if (localLruHead != LRU_END_OF_LIST &&
+		buf == &LocalBufferDescriptors[localLruHead])
 	{
 		/* buf is already the head; don't do anything. */
+		elog(DEBUG1, "LocalUsedBuffer: %i already at head", buf->buf_id);
 		return;
 	}
 	else
@@ -108,17 +114,30 @@ LocalUsedBuffer(BufferDesc *buf)
 		 * If buf is in the list already, remove it before reinserting it at
 		 * the head
 		 */
-		LocalMRURemove(buf);
-		buf->mruPrev = MRU_END_OF_LIST;
-		buf->mruNext = localMruHead;
+		LocalLRURemove(buf);
+		elog(DEBUG1, "LocalUsedBuffer: %i moving to head", buf->buf_id);
+		buf->lruPrev = LRU_END_OF_LIST;
+		buf->lruNext = localLruHead;
 
-		if (localMruHead != MRU_END_OF_LIST)
+		if (localLruHead != LRU_END_OF_LIST)
 		{
-			oldHead = &LocalBufferDescriptors[localMruHead];
-			oldHead->mruPrev = -(buf->buf_id + 2);
+			/*
+			 * Before this call, the recently used list was non-empty; we
+			 * need to update the lruPrev pointer of the old localLruHead.
+			 */
+			oldHead = &LocalBufferDescriptors[localLruHead];
+			oldHead->lruPrev = -(buf->buf_id + 2);
+		}
+		else
+		{
+			/*
+			 * Before this call, the recently used list was empty; we need
+			 * to update the localLruTail as well as the localLruHead
+			 */
+			localLruTail = -(buf->buf_id + 2);
 		}
 
-		localMruHead = -(buf->buf_id + 2);
+		localLruHead = -(buf->buf_id + 2);
 	}
 }
 
@@ -238,15 +257,15 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 
 	if (!found)
 	{
-		/* A free buffer was not found in the freelist. Run MRU. */
-		if (localMruHead == MRU_END_OF_LIST)
+		/* A free buffer was not found in the freelist. Run LRU. */
+		if (localLruTail == LRU_END_OF_LIST)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-					errmsg("MRU list empty")));
+					errmsg("LRU list empty")));
 		}
 
-		b = localMruHead;
+		b = localLruTail;
 		for (;;)
 		{
 			bufHdr = &LocalBufferDescriptors[b];
@@ -257,14 +276,14 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 				 * bufHdr is usable! Remove it from the recently used list
 				 * before moving on.
 				 */
-				LocalMRURemove(bufHdr);
+				LocalLRURemove(bufHdr);
 				LocalRefCount[b]++;
 				ResourceOwnerRememberBuffer(CurrentResourceOwner,
 											BufferDescriptorGetBuffer(bufHdr));
 				break;
 				
 			}
-			else if (bufHdr->mruNext == MRU_END_OF_LIST)
+			else if (bufHdr->lruPrev == LRU_END_OF_LIST)
 			{
 				/* Everything in the recently used list is pinned */
 				ereport(ERROR,
@@ -272,7 +291,7 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 						errmsg("no empty local buffer available")));
 			}
 			else
-				b = bufHdr->mruNext;
+				b = bufHdr->lruPrev;
 		}
 	}
 
@@ -403,7 +422,7 @@ DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
 									bufHdr->tag.forkNum),
 					 LocalRefCount[i]);
 			/* Remove from recently used list */
-			LocalMRURemove(bufHdr);
+			LocalLRURemove(bufHdr);
 			/* Remove entry from hashtable */
 			hresult = (LocalBufferLookupEnt *)
 				hash_search(LocalBufHash, (void *) &bufHdr->tag,
@@ -444,7 +463,7 @@ DropRelFileNodeAllLocalBuffers(RelFileNode rnode)
 									bufHdr->tag.forkNum),
 					 LocalRefCount[i]);
 			/* Remove from recently used list */
-			LocalMRURemove(bufHdr);
+			LocalLRURemove(bufHdr);
 			/* Remove entry from hashtable */
 			hresult = (LocalBufferLookupEnt *)
 				hash_search(LocalBufHash, (void *) &bufHdr->tag,
@@ -487,7 +506,7 @@ InitLocalBuffers(void)
 	{
 		BufferDesc *buf = &LocalBufferDescriptors[i];
 
-		buf->mruNext = buf->mruPrev = MRU_NOT_IN_LIST;
+		buf->lruNext = buf->lruPrev = LRU_NOT_IN_LIST;
 		buf->freeNext = i + 1;
 
 		/*

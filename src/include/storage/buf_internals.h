@@ -134,8 +134,8 @@ typedef struct sbufdesc
 	unsigned	refcount;		/* # of backends holding pins on buffer */
 	int			wait_backend_pid;		/* backend PID of pin-count waiter */
 
-	int 		mruNext;		/* link to buf used less recently */
-	int 		mruPrev;		/* link to buf used more recently */
+	int 		lruNext;		/* link to buf used less recently */
+	int 		lruPrev;		/* link to buf used more recently */
 
 	slock_t		buf_hdr_lock;	/* protects the above fields */
 
@@ -149,14 +149,14 @@ typedef struct sbufdesc
 #define BufferDescriptorGetBuffer(bdesc) ((bdesc)->buf_id + 1)
 
 /*
- * The mruNext and mruPrev fields each hold either an index to another buffer
- * header or one of these special values. MRU_END_OF_LIST is held in both the
- * mruNext of the last buffer in the list and the mruPrev of the first buffer
- * in the list. Both mruNext and mruPrev are MRU_NOT_IN_LIST if the buffer is
- * not in the MRU linked list.
+ * The lruNext and lruPrev fields each hold either an index to another buffer
+ * header or one of these special values. LRU_END_OF_LIST is held in both the
+ * lruNext of the last buffer in the list and the lruPrev of the first buffer
+ * in the list. Both lruNext and lruPrev are LRU_NOT_IN_LIST if the buffer is
+ * not in the LRU linked list.
  */
-#define MRU_END_OF_LIST			(-1)
-#define MRU_NOT_IN_LIST			(-2)
+#define LRU_END_OF_LIST			(-1)
+#define LRU_NOT_IN_LIST			(-2)
 
 /*
  * The freeNext field is either the index of the next freelist entry,

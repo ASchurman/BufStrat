@@ -103,8 +103,8 @@ InitBufferPool(void)
 		{
 			CLEAR_BUFFERTAG(buf->tag);
 			buf->flags = 0;
-			buf->mruNext = MRU_NOT_IN_LIST;
-			buf->mruPrev = MRU_NOT_IN_LIST;
+			buf->lruNext = LRU_NOT_IN_LIST;
+			buf->lruPrev = LRU_NOT_IN_LIST;
 			buf->refcount = 0;
 			buf->wait_backend_pid = 0;
 

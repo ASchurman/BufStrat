@@ -24,7 +24,8 @@
  */
 typedef struct
 {
-	int 		mruHead;			/* Head of MRU linked list */
+	int 		lruHead;			/* most recently used in linked list */
+	int 		lruTail;			/* least recently used in linked list */
 
 	int			firstFreeBuffer;	/* Head of list of unused buffers */
 	int			lastFreeBuffer; /* Tail of list of unused buffers */
@@ -87,7 +88,7 @@ typedef struct BufferAccessStrategyData
 static volatile BufferDesc *GetBufferFromRing(BufferAccessStrategy strategy);
 static void AddBufferToRing(BufferAccessStrategy strategy,
 				volatile BufferDesc *buf);
-static void MRURemove(volatile BufferDesc *buf);
+static void LRURemove(volatile BufferDesc *buf);
 
 
 /*
@@ -172,7 +173,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 		 * we'd better check anyway.)
 		 */
 		LockBufHdr(buf);
-		if (buf->refcount == 0 && buf->mruNext == MRU_NOT_IN_LIST)
+		if (buf->refcount == 0 && buf->lruNext == LRU_NOT_IN_LIST)
 		{
 			if (strategy != NULL)
 				AddBufferToRing(strategy, buf);
@@ -182,35 +183,35 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 	}
 
 	/*
-	 * Nothing on the freelist, so run the MRU algorithm. Note that if the head
-	 * of the mru linked list is MRU_END_OF_LIST, the list is empty. This
+	 * Nothing on the freelist, so run the LRU algorithm. Note that if the tail
+	 * of the LRU linked list is LRU_END_OF_LIST, the list is empty. This
 	 * shouldn't happen if there aren't any buffers in the freelist, but to be
 	 * safe, let's check.
 	 */
-	if (StrategyControl->mruHead == MRU_END_OF_LIST)
-		elog(ERROR, "no buffers in the MRU linked list");
+	if (StrategyControl->lruTail == LRU_END_OF_LIST)
+		elog(ERROR, "no buffers in the LRU linked list");
 
-	nextVictimBuffer = StrategyControl->mruHead;
+	nextVictimBuffer = StrategyControl->lruTail;
 	for (;;)
 	{
 		buf = &BufferDescriptors[nextVictimBuffer];
 
 		/*
 		 * If the buffer is pinned, we cannot use it; leave it in the same spot
-		 * in the MRU linked list and keep scanning.
+		 * in the LRU linked list and keep scanning.
 		 */
 		LockBufHdr(buf);
 		if (buf->refcount == 0)
 		{
-			/* buf is usable! Update the mru linked list and return buf. */
-			elog(DEBUG1, "StrategyGetBuffer: %i popping", buf->buf_id);
-			MRURemove(buf);
+			/* buf is usable! Update the LRU linked list and return buf. */
+			elog(LOG, "StrategyGetBuffer: %i popping", buf->buf_id);
+			LRURemove(buf);
 			return buf;
 		}
-		else if (buf->mruNext == MRU_END_OF_LIST)
+		else if (buf->lruPrev == LRU_END_OF_LIST)
 		{
 			/*
-			 * We've gone through all of the MRU linked list, so all of the
+			 * We've gone through all of the LRU linked list, so all of the
 			 * buffers must be pinned. As in the original PostgreSQL 9.2.2
 			 * code, we'll give up and die rather than risk getting caught in
 			 * an infinite loop while hoping that someone eventually frees
@@ -225,7 +226,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
 			 * buf isn't usable, and buf isn't at the end of the list, so
 			 * update nextVictimBuffer to check the next buffer
 			 */
-			nextVictimBuffer = buf->mruNext;
+			nextVictimBuffer = buf->lruPrev;
 			UnlockBufHdr(buf);
 		}
 	}
@@ -238,18 +239,18 @@ StrategyGetBuffer(BufferAccessStrategy strategy, bool *lock_held)
  * StrategyUsedBuffer
  * 
  *  Called by PinBuffer in bufmgr.c to indicate that a buffer has been used.
- *  This modifies the MRU linked list, placing buf at the head.
+ *  This modifies the LRU linked list, placing buf at the head.
  */
 void
 StrategyUsedBuffer(volatile BufferDesc *buf)
 {
 	volatile BufferDesc *oldHead;
 
-	if (StrategyControl->mruHead != MRU_END_OF_LIST &&
-		buf == &BufferDescriptors[StrategyControl->mruHead])
+	if (StrategyControl->lruHead != LRU_END_OF_LIST &&
+		buf == &BufferDescriptors[StrategyControl->lruHead])
 	{
 		/* buf is already the head; don't do anything. */
-		elog(DEBUG1, "StrategyUsedBuffer: %i already at head", buf->buf_id);
+		elog(LOG, "StrategyUsedBuffer: %i already at head", buf->buf_id);
 		return;
 	}
 	else
@@ -259,28 +260,40 @@ StrategyUsedBuffer(volatile BufferDesc *buf)
 		 * the head
 		 */
 		LockBufHdr(buf);
-		MRURemove(buf);
-		elog(DEBUG1, "StrategyUsedBuffer: %i moving to head", buf->buf_id);
-		buf->mruPrev = MRU_END_OF_LIST;
-		buf->mruNext = StrategyControl->mruHead;
+		LRURemove(buf);
+		elog(LOG, "StrategyUsedBuffer: %i moving to head", buf->buf_id);
+		buf->lruPrev = LRU_END_OF_LIST;
+		buf->lruNext = StrategyControl->lruHead;
 		UnlockBufHdr(buf);
 
-		if (StrategyControl->mruHead != MRU_END_OF_LIST)
+		if (StrategyControl->lruHead != LRU_END_OF_LIST)
 		{
-			oldHead = &BufferDescriptors[StrategyControl->mruHead];
+			/*
+			 * Before this call, the recently used list was non-empty; we
+			 * need to update the lruPrev pointer of the old lruHead.
+			 */
+			oldHead = &BufferDescriptors[StrategyControl->lruHead];
 			LockBufHdr(oldHead);
-			oldHead->mruPrev = buf->buf_id;
+			oldHead->lruPrev = buf->buf_id;
 			UnlockBufHdr(oldHead);
 		}
+		else
+		{
+			/*
+			 * Before this call, the recently used list was empty; we need
+			 * to update the lruTail as well as the lruHead
+			 */
+			StrategyControl->lruTail = buf->buf_id;
+		}
 
-		StrategyControl->mruHead = buf->buf_id;
+		StrategyControl->lruHead = buf->buf_id;
 	}
 }
 
 /*
  * StrategyFreeBuffer: put a buffer on the freelist
  *
- * Also removes the buffer from the MRU list.
+ * Also removes the buffer from the LRU list.
  */
 void
 StrategyFreeBuffer(volatile BufferDesc *buf)
@@ -299,7 +312,7 @@ StrategyFreeBuffer(volatile BufferDesc *buf)
 		StrategyControl->firstFreeBuffer = buf->buf_id;
 
 		LockBufHdr(buf);
-		MRURemove(buf);
+		LRURemove(buf);
 		UnlockBufHdr(buf);
 	}
 
@@ -325,7 +338,7 @@ StrategySyncStart(uint32 *complete_passes, uint32 *num_buf_alloc)
 	int			result;
 
 	LWLockAcquire(BufFreelistLock, LW_EXCLUSIVE);
-	result = StrategyControl->mruHead;
+	result = StrategyControl->lruTail;
 	if (complete_passes)
 	{
 		/*
@@ -435,8 +448,9 @@ StrategyInitialize(bool init)
 		StrategyControl->firstFreeBuffer = 0;
 		StrategyControl->lastFreeBuffer = NBuffers - 1;
 
-		/* Initialize the MRU pointer */
-		StrategyControl->mruHead = MRU_END_OF_LIST;
+		/* Initialize the LRU pointer */
+		StrategyControl->lruHead = LRU_END_OF_LIST;
+		StrategyControl->lruTail = LRU_END_OF_LIST;
 
 		/* Clear statistics */
 		StrategyControl->numBufferAllocs = 0;
@@ -449,45 +463,49 @@ StrategyInitialize(bool init)
 }
 
 /* ----------------------------------------------------------------
- *				Private MRU management functions
+ *				Private LRU management functions
  * ----------------------------------------------------------------
  */
 
 /*
- * MRURemove -- remove a buffer from the MRU linked list
+ * LRURemove -- remove a buffer from the LRU linked list
  * 
  * Does nothing if the buffer isn't already in the list.
  * Assumes that a spin lock is held on buf before calling.
  * Returns with a spin lock held on buf.
  */
 static void
-MRURemove(volatile BufferDesc *buf)
+LRURemove(volatile BufferDesc *buf)
 {
 	volatile BufferDesc *bufPrev, *bufNext;
 
-	int next = buf->mruNext;
-	int prev = buf->mruPrev;
+	int next = buf->lruNext;
+	int prev = buf->lruPrev;
 
-	if (prev == MRU_NOT_IN_LIST)
+	if (prev == LRU_NOT_IN_LIST)
 		return;
-	else if (prev == MRU_END_OF_LIST)
-		StrategyControl->mruHead = next;
+	
+	if (prev == LRU_END_OF_LIST)
+		StrategyControl->lruHead = next;
 
-	buf->mruPrev = buf->mruNext = MRU_NOT_IN_LIST;
+	if (next == LRU_END_OF_LIST)
+		StrategyControl->lruTail = prev;
+
+	buf->lruPrev = buf->lruNext = LRU_NOT_IN_LIST;
 	UnlockBufHdr(buf);
 
-	if (prev > 0)
+	if (prev >= 0)
 	{
 		bufPrev = &BufferDescriptors[prev];
 		LockBufHdr(bufPrev);
-		bufPrev->mruNext = next;
+		bufPrev->lruNext = next;
 		UnlockBufHdr(bufPrev);
 	}
-	if (next > 0)
+	if (next >= 0)
 	{
 		bufNext = &BufferDescriptors[next];
 		LockBufHdr(bufNext);
-		bufNext->mruPrev = prev;
+		bufNext->lruPrev = prev;
 		UnlockBufHdr(bufNext);
 	}
 
