@@ -465,44 +465,30 @@ MRURemove(volatile BufferDesc *buf)
 {
 	volatile BufferDesc *bufPrev, *bufNext;
 
-	if (buf->mruPrev == MRU_NOT_IN_LIST)
+	int next = buf->mruNext;
+	int prev = buf->mruPrev;
+
+	if (prev == MRU_NOT_IN_LIST)
 		return;
-	else if (buf->mruPrev == MRU_END_OF_LIST)
+	else if (prev == MRU_END_OF_LIST)
+		StrategyControl->mruHead = next;
+
+	buf->mruPrev = buf->mruNext = MRU_NOT_IN_LIST;
+	UnlockBufHdr(buf);
+
+	if (prev > 0)
 	{
-		StrategyControl->mruHead = buf->mruNext;
-		buf->mruPrev = buf->mruNext = MRU_NOT_IN_LIST;
-		UnlockBufHdr(buf);
-
-		bufNext = &BufferDescriptors[StrategyControl->mruHead];
-		LockBufHdr(bufNext);
-		bufNext->mruPrev = MRU_END_OF_LIST;
-		UnlockBufHdr(bufNext);
-	}
-	else
-	{
-		/*
-		 * buf isn't the head of the list; we need to update the mruNext
-		 * and mruPrev pointers of the buffers before and after buf.
-		 */
-		int next = buf->mruNext;
-		int prev = buf->mruPrev;
-		buf->mruPrev = buf->mruNext = MRU_NOT_IN_LIST;
-
-		/* Unlock buf as we lock and modify other buf headers */
-		UnlockBufHdr(buf);
-
 		bufPrev = &BufferDescriptors[prev];
 		LockBufHdr(bufPrev);
 		bufPrev->mruNext = next;
 		UnlockBufHdr(bufPrev);
-
-		if (next != MRU_END_OF_LIST)
-		{
-			bufNext = &BufferDescriptors[next];
-			LockBufHdr(bufNext);
-			bufNext->mruPrev = prev;
-			UnlockBufHdr(bufNext);
-		}
+	}
+	if (next > 0)
+	{
+		bufNext = &BufferDescriptors[next];
+		LockBufHdr(bufNext);
+		bufNext->mruPrev = prev;
+		UnlockBufHdr(bufNext);
 	}
 
 	/* Lock buf again like the caller expects */

@@ -64,31 +64,26 @@ LocalMRURemove(BufferDesc *bufHdr)
 {
 	BufferDesc *bufPrev, *bufNext;
 
-	if (bufHdr->mruPrev == MRU_NOT_IN_LIST)
-		return;
-	else if (bufHdr->mruPrev == MRU_END_OF_LIST)
-	{
-		localMruHead = bufHdr->mruNext;
-		bufNext = &LocalBufferDescriptors[localMruHead];
-		bufNext->mruPrev = MRU_END_OF_LIST;
-	}
-	else
-	{
-		/*
-		 * bufHdr isn't the head of the list; we need to update the mruNext
-		 * and mruPrev pointers of the buffers before and after bufHdr.
-		 */
-		bufPrev = &LocalBufferDescriptors[bufHdr->mruPrev];
-		bufPrev->mruNext = bufHdr->mruNext;
+	int next = bufHdr->mruNext;
+	int prev = bufHdr->mruPrev;
 
-		if (bufHdr->mruNext != MRU_END_OF_LIST)
-		{
-			bufNext = &LocalBufferDescriptors[bufHdr->mruNext];
-			bufNext->mruPrev = bufHdr->mruPrev;
-		}
-	}
+	if (prev == MRU_NOT_IN_LIST)
+		return;
+	else if (prev == MRU_END_OF_LIST)
+		localMruHead = next;
 
 	bufHdr->mruPrev = bufHdr->mruNext = MRU_NOT_IN_LIST;
+
+	if (prev > 0)
+	{
+		bufPrev = &LocalBufferDescriptors[prev];
+		bufPrev->mruNext = next;
+	}
+	if (next > 0)
+	{
+		bufNext = &LocalBufferDescriptors[next];
+		bufNext->mruPrev = prev;
+	}
 }
 
 /*
