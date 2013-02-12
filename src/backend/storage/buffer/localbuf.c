@@ -74,12 +74,12 @@ LocalMRURemove(BufferDesc *bufHdr)
 
 	bufHdr->mruPrev = bufHdr->mruNext = MRU_NOT_IN_LIST;
 
-	if (prev > 0)
+	if (prev >= 0)
 	{
 		bufPrev = &LocalBufferDescriptors[prev];
 		bufPrev->mruNext = next;
 	}
-	if (next > 0)
+	if (next >= 0)
 	{
 		bufNext = &LocalBufferDescriptors[next];
 		bufNext->mruPrev = prev;

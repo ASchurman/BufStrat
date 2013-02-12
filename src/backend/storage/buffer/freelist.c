@@ -476,14 +476,14 @@ MRURemove(volatile BufferDesc *buf)
 	buf->mruPrev = buf->mruNext = MRU_NOT_IN_LIST;
 	UnlockBufHdr(buf);
 
-	if (prev > 0)
+	if (prev >= 0)
 	{
 		bufPrev = &BufferDescriptors[prev];
 		LockBufHdr(bufPrev);
 		bufPrev->mruNext = next;
 		UnlockBufHdr(bufPrev);
 	}
-	if (next > 0)
+	if (next >= 0)
 	{
 		bufNext = &BufferDescriptors[next];
 		LockBufHdr(bufNext);
