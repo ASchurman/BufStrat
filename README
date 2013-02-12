@@ -1,3 +1,23 @@
+BufStrat
+========
+
+This repository is an exercise in modifying the buffer replacement
+strategy of PostgreSQL 9.2.2.
+
+The master branch contains the original code, which uses the clock
+replacement algorithm as its default strategy and switches to a
+buffer ring replacement strategy for some queries for which it's more
+effective than clock.
+
+The clock branch differs from master in that it only uses the clock
+strategy; the buffer ring replacement strategy is disabled for all
+queries in the clock branch.
+
+The mru and lru branches use the MRU and LRU replacement strategies
+respectively.
+
+Below is the original PostgreSQL 9.2.2 README:
+
 PostgreSQL Database Management System
 =====================================
 
